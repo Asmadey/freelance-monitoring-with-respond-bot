@@ -224,4 +224,4 @@ API profi.ru (`api.profi.ru`) доступен только через росс�
 **Влад** — 3 года внедряет ИИ в бизнес: AI-агенты, RAG-боты, голосовые агенты, LLM-автоматизации. 15+ запущенных решений.
 
 - Сайт: [proshinsky.com](https://proshinsky.com)
-- Telegram: [@fl_aibot](https://t.me/fl_aibot)
+- Telegram: [@asmadeyi](https://t.me/asmadeyi)
