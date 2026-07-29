@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.env
+*.jsonl
+fl_aibot_token.txt
