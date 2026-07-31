@@ -46,6 +46,9 @@ if not _TOK_FILE.exists():
 TG_BOT_TOKEN=_TOK_FILE.read_text().strip() if _TOK_FILE.exists() else ""
 TG_CHAT_ID = "128204572"
 
+# Authorised users — only these Telegram user IDs can use the bot
+ALLOWED_USERS = {128204572, 253309061}
+
 # Ollama API (deepseek-v4-flash)
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "https://ollama.com/v1")
 OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "")
@@ -76,8 +79,16 @@ JSONL_MAP = {
 # Firecrawl (for youdo full text)
 FIRECRAWL_URL = "http://127.0.0.1:9123/v2/scrape"
 
-# Max cover letter length
-MAX_LETTER_LEN = 500
+# Per-source letter length limits (profi.ru has a 500-char platform cap)
+LETTER_LIMITS = {
+    "profi": 500,
+    "upwork": 1200,
+    "kwork": 1200,
+    "fl": 1200,
+    "freelance": 1200,
+    "youdo": 1200,
+}
+DEFAULT_LETTER_LIMIT = 1200
 
 app = FastAPI(title="Cover Letter Bot")
 
@@ -88,7 +99,7 @@ def load_system_prompt() -> str:
     """Load system prompt from markdown file."""
     if not SYSTEM_PROMPT_PATH.exists():
         logger.error("System prompt file not found: %s", SYSTEM_PROMPT_PATH)
-        return "Ты — Влад, AI-разработчик. Создай короткий отклик на задание с фриланс-биржи. Объём: не более 500 символов."
+        return "Ты — Влад, AI-разработчик. Создай короткий отклик на задание с фриланс-биржи. Объём: не более {CHAR_LIMIT} символов."
     return SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
 
 
@@ -194,6 +205,63 @@ def fetch_youdo_full_text(task_id: str) -> dict:
         return {"title": "", "description": "", "client": ""}
 
 
+def fetch_profi_client_name(order_id: str) -> str:
+    """Fetch client name from Profi.ru GraphQL by re-querying BoSearchBoardItems.
+    
+    The board search doesn't support filtering by order ID directly,
+    but the order usually appears in the first page of results.
+    If found, returns clientInfo.name. Otherwise returns empty string.
+    """
+    import subprocess
+    
+    logger.info("profi: fetching client name for order %s via GraphQL", order_id)
+    
+    # Use the existing fetch script to get fresh data (handles JWT refresh internally)
+    try:
+        result = subprocess.run(
+            ["python3", "/home/hermes/.hermes/scripts/profi_graphql_fetch.py"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0:
+            logger.warning("profi_graphql_fetch.py exited %d: %s", result.returncode, result.stderr[:200])
+            return ""
+        
+        # Skip first line (JWT info), parse rest as JSON
+        lines = result.stdout.strip().split("\n")
+        json_start = 0
+        for i, line in enumerate(lines):
+            if line.strip().startswith("{"):
+                json_start = i
+                break
+        
+        json_str = "\n".join(lines[json_start:])
+        data = json.loads(json_str)
+        
+        # Search all snippets for matching ID
+        for snippet in data.get("ai_orders", []):
+            if str(snippet.get("id", "")) == str(order_id):
+                ci = snippet.get("clientInfo", {})
+                name = ci.get("name", "")
+                if name:
+                    logger.info("profi: found client name for %s: %s", order_id, name)
+                    return name
+        
+        # Also check all snippets (not just AI orders)
+        for snippet in data.get("all_snippets", []):
+            if str(snippet.get("id", "")) == str(order_id):
+                ci = snippet.get("clientInfo", {})
+                name = ci.get("name", "")
+                if name:
+                    logger.info("profi: found client name for %s: %s", order_id, name)
+                    return name
+        
+        logger.warning("profi: order %s not found in current board results", order_id)
+        return ""
+    except Exception as e:
+        logger.error("profi: failed to fetch client name: %s", e)
+        return ""
+
+
 def get_order_text(source: str, order_id: str) -> str:
     """Get full order text for LLM prompt.
     
@@ -219,6 +287,11 @@ def get_order_text(source: str, order_id: str) -> str:
                 desc = fc_data["description"]
             if not title and fc_data["title"]:
                 title = fc_data["title"]
+        
+        # For profi.ru, if client name is missing, fetch via GraphQL
+        if source == "profi" and not client:
+            logger.info("profi: client name missing in JSONL, fetching via GraphQL")
+            client = fetch_profi_client_name(order_id)
         
         text = f"Заголовок: {title}\n"
         if client:
@@ -305,7 +378,7 @@ def answer_callback(callback_id: str, text: str = "") -> None:
         logger.warning("answerCallbackQuery failed: %s", e)
 
 
-def truncate_to_limit(text: str, limit: int = MAX_LETTER_LEN) -> str:
+def truncate_to_limit(text: str, limit: int = DEFAULT_LETTER_LIMIT) -> str:
     """Ensure text is within limit, truncate with ellipsis if needed."""
     if len(text) <= limit:
         return text
@@ -340,8 +413,15 @@ async def webhook(request: Request) -> Response:
     message = callback.get("message", {})
     chat_id = message.get("chat", {}).get("id", TG_CHAT_ID)
     message_id = message.get("message_id")
-    
-    logger.info("Callback received: data=%s, chat=%s, msg=%s", data, chat_id, message_id)
+    user_id = callback.get("from", {}).get("id", 0)
+
+    logger.info("Callback received: data=%s, chat=%s, msg=%s, user=%s", data, chat_id, message_id, user_id)
+
+    # Authorisation check — only whitelisted users can use the bot
+    if user_id not in ALLOWED_USERS:
+        logger.warning("Unauthorized user %s attempted to use bot", user_id)
+        answer_callback(callback_id, "⛔ Нет доступа")
+        return Response(status_code=200)
     
     # Parse callback_data: "reply:{source}:{order_id}"
     parts = data.split(":", 2)
@@ -361,11 +441,19 @@ async def webhook(request: Request) -> Response:
         order_text = get_order_text(source, order_id)
         logger.info("Order text: %d chars", len(order_text))
         
-        # 2. Call LLM
-        cover_letter = call_llm(SYSTEM_PROMPT, order_text)
+        # 2. Determine per-source character limit
+        char_limit = LETTER_LIMITS.get(source, DEFAULT_LETTER_LIMIT)
+
+        # 3. Build prompt with source-specific limit instruction
+        prompt_with_limit = SYSTEM_PROMPT.replace(
+            "{CHAR_LIMIT}", str(char_limit)
+        ) if "{CHAR_LIMIT}" in SYSTEM_PROMPT else SYSTEM_PROMPT
+
+        # 4. Call LLM
+        cover_letter = call_llm(prompt_with_limit, order_text)
         
-        # 3. Truncate to 500 chars
-        cover_letter = truncate_to_limit(cover_letter)
+        # 5. Truncate to source-specific limit
+        cover_letter = truncate_to_limit(cover_letter, limit=char_limit)
         
         # 4. Send as monospace (preformatted) — copy-pasteable
         tg_text = f"<pre>{html.escape(cover_letter)}</pre>"

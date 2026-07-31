@@ -145,12 +145,13 @@ crontab -e
 cover-letter-bot/
 ├── cover_letter_bot.py              # FastAPI webhook + LLM генерация
 ├── cover_letter_system_prompt.md    # System prompt для LLM
-├── profi_graphql_check.py           # Profi.ru GraphQL scraper
-├── youdo_check.py                   # YouDo scraper
+├── profi_graphql_check.py           # Profi.ru GraphQL scraper + client name fetch
+├── youdo_check.py                   # YouDo scraper (multi-query + Firecrawl descriptions)
 ├── kwork_check.py                   # Kwork scraper
 ├── fl_ru_scraper.py                 # FL.ru scraper
 ├── freelance_ru_scraper.py          # Freelance.ru scraper
 ├── upwork_scraper.py                # Upwork scraper
+├── freelance_ai_daily_report.py    # Aggregated daily report (all 3 sources → single TG message)
 ├── .gitignore
 └── README.md
 ```
@@ -209,15 +210,51 @@ def truncate_to_limit(text: str, limit: int = 500) -> str:
 ### VPN для Profi.ru
 
 API profi.ru (`api.profi.ru`) доступен только через российский IP. Скрапер использует SOCKS5-прокси через Xray:
-- `socks5h://127.0.0.1:1080` — DNS резолвится через прокси (не локально)
+- `socks5h://127.0.0.1:10808` — DNS резолвится через прокси (не локально)
 - Xray-сервис: `xray-profi.service` (systemd)
+- Auto-fallback: при недоступности SOCKS5 → прямой connection (api.profi.ru доступен с Hetzner напрямую)
+- App version: `x-warp-ui-ver: 1.152.2`, `User-Agent: rbo/261981023` (обновление 2026-07-31)
 
-### YouDo WAF bypass
+### YouDo multi-query search
 
-Прямой `requests.get()` к `youdo.com` возвращает 403 (Cloudflare/WAF). Решение — Firecrawl:
+Youdo API использует HMAC-SHA256 подписи (per-URL, `KeyVersion: 1`). Подпись вычисляется над точным URL — смена любого параметра (включая `SearchRequestId`, `lat`, `lng`, `q`) ломает подпись. Подписи стабильны — не протухают.
+
+Скрапер запрашивает 6 endpoints:
+1. General IT listing (Category=4194304, без поиска, 50 tasks)
+2. `q=ии` (все категории Cat=1, 26 tasks)
+3. `q=AI` (Cat=4194304, 3 tasks)
+4. `q=Ии` (Cat=4194304, 3 tasks)
+5. `q=aeo` (Cat=1, 1 task)
+6. `q=AEO` (Cat=4194304, 1 task)
+
+Дедупликация по task ID. Всего ~76 уникальных задач, ~14 AI-матчей.
+
+Новые поисковые запросы (`q=chatgpt`, `q=LLM` и т.д.) требуют нового Proxyman HAR-захвата с iOS-приложения.
+
+### YouDo description + WAF bypass
+
+Листинг API возвращает `Description: ""`. Полное описание скрапится через Firecrawl:
 - `POST http://127.0.0.1:9123/v2/scrape` с URL `https://youdo.com/t{id}`
 - Извлекается секция «Нужно» (полное описание задачи)
-- On-demand — только при нажатии кнопки, не при каждом скрапинге
+- `servicepipe.tech` JS-challenge блокирует raw `requests.get()` — Firecrawl обходит через headless render
+
+### Profi.ru client name fetch
+
+GraphQL `BoSearchBoardItems` возвращает `clientInfo.name: null`. Имя клиента fetch'ится через mobile backoffice API:
+- `POST https://api.profi.ru/mobile/backoffice/v2/` (multipart/form-data)
+- Method: `getKlientInfo`, `data.order_id`
+- Response: `data.name` (например «Леонид»)
+
+### Per-source cover letter limits
+
+| Source | Max chars |
+|---|---|
+| profi.ru | 500 (platform cap) |
+| upwork | 1200 |
+| kwork | 1200 |
+| fl.ru | 1200 |
+| freelance.ru | 1200 |
+| youdo | 1200 |
 
 ## Автор
 

@@ -77,6 +77,7 @@ YOUDO_SIG = "UnqICVwA2OHRzcMAwyBCiEdoVizRqOf7Xar8l4Q6zyM="
 
 YOUDO_HEADERS = {
     "Host": "api.youdo.com",
+    "X-AdvId": "837262DA-8F62-4D19-AF65-31C99119BED7",
     "Accept": "*/*",
     "KeyVersion": "1",
     "X-FeatureSetId": "976",
@@ -85,7 +86,7 @@ YOUDO_HEADERS = {
     "X-VisitorId": "E38D2FBB-515B-4B6D-AD76-665B0027C70A",
     "X-DeviceId": "E38D2FBB-515B-4B6D-AD76-665B0027C70A",
     "User-Agent": (
-        "26.5.2,4.225.0.2994664,iosPhoneApp,430x932,3,apple,"
+        "26.5.2,4.226.0.3030102,iosPhoneApp,430x932,3,apple,"
         "iPhone16_2,E38D2FBB-515B-4B6D-AD76-665B0027C70A"
     ),
     "Connection": "keep-alive",
@@ -216,32 +217,124 @@ def cover_letter_keyboard(order_id: str) -> dict:
     }
 
 
+# Secondary search URLs: targeted search by keyword (HMAC per-URL, sig from Proxyman HAR)
+# Each (url, sig) pair is frozen — works indefinitely for that exact URL.
+YOUDO_SEARCH_QUERIES = [
+    # q=ии (all categories Cat=1, priceMin=10000) — 26 tasks, broadest AI search
+    (
+        "https://api.youdo.com/v110/tasks/tasks?status=Opened&q=%D0%B8%D0%B8&priceMin=10000.0&onlySbr=false&onlyVirtual=false&noOffers=false&onlyB2b=false&onlyRecommended=false&onlyVacancies=false&Category=1&lat=61.698657&lng=99.505405&page=1&pageSize=50&SearchRequestId=18229686-1E1C-43E9-BA0D-2FB4900D6688",
+        "79Oq4vy7/24HCbr7Xds0/9NnDWsbn4nBK/3Tm7KTv5s=",
+    ),
+    # q=AI (Cat=4194304 IT, priceMin=10000) — 3 tasks
+    (
+        "https://api.youdo.com/v110/tasks/tasks?status=Opened&q=AI&priceMin=10000.0&onlySbr=false&onlyVirtual=false&noOffers=false&onlyB2b=false&onlyRecommended=false&onlyVacancies=false&Category=4194304&lat=61.698657&lng=99.505405&page=1&pageSize=50&SearchRequestId=272B77AB-5F05-4DBC-9A38-AA833AE64760",
+        "YfNfdfOLb9uPPY6aZDAI4vg4SjoC6HMu44BxSVGHyPA=",
+    ),
+    # q=Ии (Cat=4194304 IT, priceMin=10000) — 3 tasks
+    (
+        "https://api.youdo.com/v110/tasks/tasks?status=Opened&q=%D0%98%D0%B8&priceMin=10000.0&onlySbr=false&onlyVirtual=false&noOffers=false&onlyB2b=false&onlyRecommended=false&onlyVacancies=false&Category=4194304&lat=61.698657&lng=99.505405&page=1&pageSize=50&SearchRequestId=B2462B4A-0297-4CA5-B01E-D8E256FC2C24",
+        "jV9hZpGAKfVIJiUMIviZy6/biK+iPkq4txToZmWUcIE=",
+    ),
+    # q=aeo (Cat=1 all, priceMin=10000) — 1 task
+    (
+        "https://api.youdo.com/v110/tasks/tasks?status=Opened&q=aeo&priceMin=10000.0&onlySbr=false&onlyVirtual=false&noOffers=false&onlyB2b=false&onlyRecommended=false&onlyVacancies=false&Category=1&lat=61.698657&lng=99.505405&page=1&pageSize=50&SearchRequestId=5DE4E61F-C241-4E12-B287-60C54F415CB2",
+        "ItWH80cBsl/Xkj9hNKp5A44Z8lepIItWbbaPxAeesxk=",
+    ),
+    # q=AEO (Cat=4194304 IT, priceMin=10000) — 1 task
+    (
+        "https://api.youdo.com/v110/tasks/tasks?status=Opened&q=AEO&priceMin=10000.0&onlySbr=false&onlyVirtual=false&noOffers=false&onlyB2b=false&onlyRecommended=false&onlyVacancies=false&Category=4194304&lat=61.698657&lng=99.505405&page=1&pageSize=50&SearchRequestId=F41E2F2E-DC52-42E8-BC8F-52FE476C2619",
+        "JSb/70Ykz/Zv5e9QIsod9uO8vFApLa/aNOTgPF79Uv0=",
+    ),
+]
+
+
 def fetch_tasks() -> list:
-    """Fetch tasks from Youdo API. Returns list of task dicts."""
+    """Fetch tasks from Youdo API using general IT listing + multiple AI search queries.
+    Returns deduplicated list of task dicts."""
+    all_tasks = []
+    seen_ids = set()
+
+    # Build URL list: general listing + all search queries
+    urls = [(YOUDO_URL, YOUDO_HEADERS, "general IT")]
+    for search_url, search_sig in YOUDO_SEARCH_QUERIES:
+        q_match = ""
+        if "q=" in search_url:
+            import urllib.parse as _up
+            q_match = _up.parse_qs(_up.urlparse(search_url).query).get("q", [""])[0]
+        urls.append((search_url, {**YOUDO_HEADERS, "Signature": search_sig}, f"q={q_match}"))
+
+    for url, headers, label in urls:
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code != 200:
+                logger.error(f"[{label}] HTTP {resp.status_code}")
+                continue
+            data = resp.json()
+            if not data.get("IsSuccess", True) and data.get("Code"):
+                logger.error(f"[{label}] API error: Code={data['Code']}, Message={data.get('Message', '')}")
+                continue
+            items = data.get("ResultObject", {}).get("Items", [])
+            total = data.get("ResultObject", {}).get("TotalCount", "?")
+            new = 0
+            for item in items:
+                tid = str(item.get("Id", ""))
+                if tid and tid not in seen_ids:
+                    seen_ids.add(tid)
+                    all_tasks.append(item)
+                    new += 1
+            logger.info(f"[{label}] Fetched {len(items)} tasks (total: {total}), {new} new after dedup")
+        except Exception as e:
+            logger.error(f"[{label}] Fetch failed: {e}")
+
+    logger.info(f"Total unique tasks after dedup: {len(all_tasks)}")
+    return all_tasks
+
+
+def fetch_task_description(task_id: str, timeout: int = 15) -> str:
+    """Fetch full task description from youdo.com/t<id> via Firecrawl rotator.
+    Extracts the 'Нужно' section from rendered page.
+    Returns empty string on failure (non-fatal — listing API description is used as fallback).
+    """
     try:
-        resp = requests.get(YOUDO_URL, headers=YOUDO_HEADERS, timeout=15)
+        import requests as _r
+        url = f"https://youdo.com/t{task_id}"
+        resp = _r.post(
+            "http://127.0.0.1:9123/v2/scrape",
+            json={
+                "url": url,
+                "formats": ["markdown"],
+                "onlyMainContent": True,
+                "waitFor": 2000,
+            },
+            timeout=timeout,
+        )
         if resp.status_code != 200:
-            logger.error(f"HTTP {resp.status_code}")
-            return []
-
+            logger.debug(f"Firecrawl status {resp.status_code} for {url}")
+            return ""
         data = resp.json()
-        if not data.get("IsSuccess", True) and data.get("Code"):
-            logger.error(f"API error: Code={data['Code']}, Message={data.get('Message', '')}")
-            return []
-
-        items = data.get("ResultObject", {}).get("Items", [])
-        logger.info(f"Fetched {len(items)} tasks (total: {data.get('ResultObject',{}).get('TotalCount','?')})")
-        return items
+        if not data.get("success"):
+            logger.debug(f"Firecrawl error for {url}: {data.get('error', '')}")
+            return ""
+        md = data.get("data", {}).get("markdown", "")
+        # Extract 'Нужно' section — text between "Нужно\n" and next section
+        m = re.search(r"Нужно\s*\n(.+?)(?:\nОткликнуться|\n####|\nЗаказчик|\Z)", md, re.DOTALL)
+        if m:
+            desc = m.group(1).strip()
+            # Strip code block markers if present
+            desc = re.sub(r"^```\n?", "", desc).strip()
+            desc = re.sub(r"\n?```$", "", desc).strip()
+            return desc
+        return ""
     except Exception as e:
-        logger.error(f"Fetch failed: {e}")
-        return []
+        logger.debug(f"fetch_task_description error for {task_id}: {e}")
+        return ""
 
 
-def format_task_message(task: dict) -> str:
+def format_task_message(task: dict, fetched_desc: str = "") -> str:
     """Format a task as a Telegram message."""
     task_id = task.get("Id", "?")
     name = task.get("Name", "Без названия")
-    desc = task.get("Description", "")
+    desc = task.get("Description", "") or fetched_desc
     category = task.get("CategoryName", "")
     budget = task.get("Budget", {})
     max_price = budget.get("Max")
@@ -322,8 +415,16 @@ def main():
     logger.info(f"Found {len(new_ai_orders)} new AI orders from Youdo.com")
 
     for task in new_ai_orders:
-        msg = format_task_message(task)
         oid = str(task.get("Id", ""))
+        # Fetch full description from youdo.com if listing API didn't provide one
+        fetched_desc = ""
+        if not task.get("Description"):
+            logger.info(f"Fetching full desc for: {task.get('Name', '')[:50]}...")
+            fetched_desc = fetch_task_description(oid)
+            if fetched_desc:
+                logger.info(f"  Got desc ({len(fetched_desc)} chars)")
+                task["Description"] = fetched_desc  # store for JSONL
+        msg = format_task_message(task, fetched_desc=fetched_desc)
         if send_telegram(msg, reply_markup=cover_letter_keyboard(oid)):
             logger.info(f"Sent: [{task['Id']}] {task['Name'][:50]}")
         else:

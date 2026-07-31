@@ -34,7 +34,23 @@ logger = logging.getLogger("profi_graphql_check")
 TG_BOT_TOKEN = "8776532572:AAGh2OnHOaUjZAs-M-04nluayq2-qM4O8fk"
 TG_CHAT_ID = "128204572"
 
-PROXY = {"http": "socks5h://127.0.0.1:10808", "https": "socks5h://127.0.0.1:10808"}
+SOCKS_PROXY = {"http": "socks5h://127.0.0.1:10808", "https": "socks5h://127.0.0.1:10808"}
+NO_PROXY = None  # direct connection
+
+def get_proxy():
+    """Return working proxy dict, or None for direct connection.
+    Tests SOCKS5 proxy with a quick TCP connect; falls back to direct if unavailable.
+    """
+    import socket as _sock
+    try:
+        s = _sock.create_connection(("127.0.0.1", 10808), timeout=3)
+        s.close()
+        return SOCKS_PROXY
+    except OSError:
+        logger.warning("SOCKS5 proxy unavailable, using direct connection")
+        return NO_PROXY
+
+PROXY = get_proxy()
 GRAPHQL_URL = "https://api.profi.ru/warp/v2/graphql"
 
 DATA_DIR = Path(os.path.expanduser("~/.hermes/data/profi_graphql"))
@@ -170,14 +186,14 @@ def build_headers(jwt):
         "Host": "api.profi.ru",
         "x-app-id": "BO",
         "Accept": "application/json",
-        "x-warp-ui-ver": "1.151.9",
+        "x-warp-ui-ver": "1.152.2",
         "x-warp-ui-app": "RNMOBBO",
         "Authorization": f"JWT {jwt}",
         "x-warp-consumer": "MOBILE",
         "Accept-Language": "ru",
         "x-warp-ui-type": "IOS",
         "x-new-auth-compatible": "1",
-        "User-Agent": "rbo/261342037 CFNetwork/3860.600.12 Darwin/25.5.0",
+        "User-Agent": "rbo/261981023 CFNetwork/3860.600.12 Darwin/25.5.0",
         "Content-Type": "application/json",
     }
 
@@ -233,8 +249,58 @@ def extract_location(snippet: dict) -> str:
 
 
 def extract_client_name(snippet: dict) -> str:
+    # GraphQL field: snippet.clientInfo.name (BoSearchSnippet) — usually null
+    client_info = snippet.get("clientInfo") or {}
+    name = client_info.get("name", "") or ""
+    if name:
+        return name
+    # Fallback: legacy header.clientName
     header = snippet.get("header") or {}
     return header.get("clientName", "") or ""
+
+
+def fetch_client_name(order_id: str, jwt: str = None, cookies: dict = None, timeout: int = 10) -> str:
+    """Fetch client name from Profi.ru mobile backoffice API (getKlientInfo).
+    GraphQL BoSearchBoardItems returns clientInfo.name=null, so we need this separate call.
+    Returns empty string on failure (non-fatal).
+    """
+    try:
+        if jwt is None or cookies is None:
+            cookies = load_cookies()
+            jwt = load_jwt()
+        if not jwt:
+            return ""
+        request_body = {
+            "meta": {
+                "method": "getKlientInfo",
+                "store_src": "",
+                "ui_type": "IOS",
+                "ui_app": "RNMOBBO",
+                "ui_ver": "1.152.2",
+                "ui_os": "26.5.2",
+                "codepush_version": "0b77103a-da05-3aef-8338-c57ef2fcd9d0",
+                "native_version": "1.152.0",
+            },
+            "data": {"order_id": str(order_id)},
+        }
+        files = {"request": (None, json.dumps(request_body), "application/json")}
+        headers = build_headers(jwt)
+        headers.pop("Content-Type", None)  # multipart boundary set by requests
+        resp = requests.post(
+            "https://api.profi.ru/mobile/backoffice/v2/",
+            headers=headers,
+            cookies=cookies,
+            files=files,
+            proxies=PROXY,
+            timeout=timeout,
+        )
+        if resp.status_code != 200:
+            return ""
+        data = resp.json()
+        return data.get("data", {}).get("name", "") or ""
+    except Exception as e:
+        logger.debug(f"fetch_client_name error for {order_id}: {e}")
+        return ""
 
 
 def snippet_tags(snippet: dict) -> list[str]:
@@ -261,11 +327,11 @@ def order_url(snippet: dict) -> str:
     return f"https://profi.ru/backoffice/n.php?o={snippet['id']}"
 
 
-def format_order(snippet: dict) -> str:
+def format_order(snippet: dict, fetched_client: str = "") -> str:
     title = snippet.get("title", "Без названия")
     price = extract_price(snippet)
     location = extract_location(snippet)
-    client = extract_client_name(snippet)
+    client = extract_client_name(snippet) or fetched_client
     desc = snippet.get("description", "")
     if len(desc) > 300:
         desc = desc[:300] + "…"
@@ -468,6 +534,8 @@ def main() -> int:
     logger.info("Fetched %d snippets", len(snippets))
 
     new_ai_orders = []
+    jwt = load_jwt()
+    cookies = load_cookies()
     for s in snippets:
         oid = str(s.get("id", ""))
         if not oid:
@@ -476,13 +544,20 @@ def main() -> int:
             continue
         seen_ids.add(oid)
 
+        # Fetch client name from mobile backoffice API (GraphQL returns null)
+        client_name = extract_client_name(s)
+        if not client_name:
+            client_name = fetch_client_name(oid, jwt=jwt, cookies=cookies)
+            if client_name:
+                logger.info(f"  Client for {oid}: {client_name}")
+
         record = {
             "id": oid,
             "title": s.get("title", ""),
             "description": s.get("description", ""),
             "price": extract_price(s),
             "location": extract_location(s),
-            "client": extract_client_name(s),
+            "client": client_name,
             "tags": snippet_tags(s),
             "source": "profi.ru",
             "collected_at": datetime.now(timezone.utc).isoformat(),
@@ -490,6 +565,7 @@ def main() -> int:
         append_jsonl(record)
 
         if is_ai_order(s):
+            s["_fetched_client"] = client_name
             new_ai_orders.append(s)
 
     save_seen_ids(seen_ids)
@@ -498,7 +574,8 @@ def main() -> int:
         logger.info("Found %d new AI orders", len(new_ai_orders))
         for s in new_ai_orders:
             oid = str(s.get("id", ""))
-            send_telegram(format_order(s), reply_markup=cover_letter_keyboard(oid))
+            fetched_client = s.pop("_fetched_client", "")
+            send_telegram(format_order(s, fetched_client=fetched_client), reply_markup=cover_letter_keyboard(oid))
             time.sleep(0.5)
     else:
         logger.info("No new AI orders from profi.ru")
