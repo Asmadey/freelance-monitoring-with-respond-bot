@@ -336,7 +336,7 @@ def format_task_message(task: dict, fetched_desc: str = "") -> str:
     name = task.get("Name", "Без названия")
     desc = task.get("Description", "") or fetched_desc
     category = task.get("CategoryName", "")
-    budget = task.get("Budget", {})
+    budget = task.get("Budget") or {}
     max_price = budget.get("Max")
     min_price = budget.get("Min")
     location = task.get("Location", {}).get("Address", "")
@@ -416,43 +416,47 @@ def main():
 
     for task in new_ai_orders:
         oid = str(task.get("Id", ""))
-        # Fetch full description from youdo.com if listing API didn't provide one
-        fetched_desc = ""
-        if not task.get("Description"):
-            logger.info(f"Fetching full desc for: {task.get('Name', '')[:50]}...")
-            fetched_desc = fetch_task_description(oid)
-            if fetched_desc:
-                logger.info(f"  Got desc ({len(fetched_desc)} chars)")
-                task["Description"] = fetched_desc  # store for JSONL
-        msg = format_task_message(task, fetched_desc=fetched_desc)
-        if send_telegram(msg, reply_markup=cover_letter_keyboard(oid)):
-            logger.info(f"Sent: [{task['Id']}] {task['Name'][:50]}")
-        else:
-            logger.warning(f"Failed to send: [{task['Id']}]")
+        try:
+            # Fetch full description from youdo.com if listing API didn't provide one
+            fetched_desc = ""
+            if not task.get("Description"):
+                logger.info(f"Fetching full desc for: {task.get('Name', '')[:50]}...")
+                fetched_desc = fetch_task_description(oid)
+                if fetched_desc:
+                    logger.info(f"  Got desc ({len(fetched_desc)} chars)")
+                    task["Description"] = fetched_desc  # store for JSONL
+            msg = format_task_message(task, fetched_desc=fetched_desc)
+            if send_telegram(msg, reply_markup=cover_letter_keyboard(oid)):
+                logger.info(f"Sent: [{task['Id']}] {task['Name'][:50]}")
+            else:
+                logger.warning(f"Failed to send: [{task['Id']}]")
 
-        # Save to JSONL
-        append_jsonl({
-            "id": str(task.get("Id", "")),
-            "title": task.get("Name", ""),
-            "description": task.get("Description", ""),
-            "price": task.get("Budget", {}).get("Max", ""),
-            "location": task.get("Location", {}).get("Address", ""),
-            "client": task.get("CreatorName", ""),
-            "category": task.get("CategoryName", ""),
-            "source": "youdo.com",
-            "collected_at": datetime.now(timezone.utc).isoformat(),
-        })
+            # Save to JSONL
+            append_jsonl({
+                "id": str(task.get("Id", "")),
+                "title": task.get("Name", ""),
+                "description": task.get("Description", ""),
+                "price": (task.get("Budget") or {}).get("Max", ""),
+                "location": (task.get("Location") or {}).get("Address", ""),
+                "client": task.get("CreatorName", ""),
+                "category": task.get("CategoryName", ""),
+                "source": "youdo.com",
+                "collected_at": datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception as e:
+            logger.error(f"Error processing task {oid}: {e}")
 
-        # Mark as seen
+        # Mark as seen IMMEDIATELY (not after loop) — prevents re-send on crash
         task_id = str(task.get("Id", ""))
         if task_id not in seen_ids:
             seen_ids.append(task_id)
+        save_seen_ids(seen_ids)  # save after each task
 
     # Keep seen_ids list from growing unbounded (max 1000)
     if len(seen_ids) > 1000:
         seen_ids = seen_ids[-1000:]
+        save_seen_ids(seen_ids)
 
-    save_seen_ids(seen_ids)
     logger.info(f"Done. Seen ids: {len(seen_ids)}")
 
 
