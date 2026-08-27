@@ -66,13 +66,32 @@ POSITIVE_KEYWORDS = [
     "vector database", "векторная баз",
     "embedding", "эмбеддинг",
     "semantic search", "семантический поиск",
-    "prompt engineering", "промпт инжиниринг",
+    "prompt engineering", "промпт инжиниринг", "промпт", "prompt",
     "fine-tuning", "файнтюнинг", "дообучение",
     "ai automation", "ии автоматизаци",
     "ai pipeline", "ai пайплайн", "ai-пайплайн",
-    "голосовой робот", "voice bot", "voicebot",
+    "голосовой робот", "голосовых робот", "voice bot", "voicebot",
     "ai-помощник", "ии-помощник",
     "copilot",
+    # Broad keywords (added 2026-08-06 — were missing, causing 0 matches)
+    "искусственный интеллект", "нейросет", "нейронная сеть",
+    "artificial intelligence", "machine learning",
+    "chatgpt", "openai", "data science", "data scientist",
+    "automation", "автоматизац",
+    "make.com", "no-code", "low-code",
+    "машинное обучение", "deep learning", "обучение нейросет",
+    "генеративный", "generative ai",
+    "предиктивная аналитика", "распознавание", "computer vision",
+    "анализ данных", "data analysis",
+    "natural language processing", "nlp",
+    "autogpt", "api интеграция",
+    "telegram бот", "telegram-бот", "телеграм бот", "телеграм-бот",
+    "vapi", "retell", "elevenlabs",
+    "замена объекта на видео", "переодеть спикера",
+    "ai видео", "ии видео", "ai ролик", "ии ролик",
+    "промт", "promt",  # common typo
+    "агент", "agent",
+    "chatbot", "ассистент",
 ]
 
 NEGATIVE_KEYWORDS = [
@@ -82,8 +101,6 @@ NEGATIVE_KEYWORDS = [
     "разметка", "асессор", "полигональная разметка",
     "контент-завод", "контент завод",
     "ai-аватар", "ai аватар",
-    "ai видео", "ai ролик",
-    "карточка для рекламы",
     "ai-ассистент / smm",
     "ai-артист", "ии-артист",
     "отцифровать", "оцифровать",
@@ -99,9 +116,16 @@ MONTHS = {
 
 # ── Telegram: @fl_aibot ──────────────────────────────────
 # Token read from youdo_check.py (same bot @fl_aibot)
-TG_BOT_TOKEN="8776532572:AAGh2OnHOaUjZAs-M-04nluayq2-qM4O8fk"
-TG_CHAT_ID = "128204572"
-TG_CHAT_ID = "128204572"
+# Load @fl_aibot token from external file
+import os as _os
+_TF = "/home/hermes/.hermes/config/fl_aibot_token.txt"
+TG_BOT_TOKEN = open(_TF).read().strip() if _os.path.exists(_TF) else os.environ.get("TG_BOT_TOKEN", "")
+if not TG_BOT_TOKEN or "***" in TG_BOT_TOKEN:
+    raise RuntimeError(f"Cannot load @fl_aibot token from {_TF}")
+
+# Multi-chat: send to all authorised users via shared helper
+import tg_multicast
+TG_CHAT_IDS = tg_multicast.get_chat_ids()
 
 
 # ── Time parsing ─────────────────────────────────────────
@@ -461,27 +485,11 @@ def write_to_google_sheets(jobs):
 
 # ── Telegram ─────────────────────────────────────────────
 def send_telegram(text, parse_mode="HTML", reply_markup=None):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        return False
-    try:
-        payload = {
-            "chat_id": TG_CHAT_ID,
-            "text": text,
-            "parse_mode": parse_mode,
-            "disable_web_page_preview": True,
-        }
-        if reply_markup:
-            payload["reply_markup"] = reply_markup
-        resp = requests.post(
-            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-            json=payload,
-            timeout=20,
-        )
-        resp.raise_for_status()
-        return True
-    except Exception as e:
-        print(f"[fl.ru] Telegram send failed: {e}", file=sys.stderr)
-        return False
+    """Send message to all chats via multicast helper."""
+    return tg_multicast.send_multicast(
+        TG_BOT_TOKEN, TG_CHAT_IDS, text,
+        parse_mode=parse_mode, reply_markup=reply_markup, tag="fl.ru",
+    )
 
 
 def cover_letter_keyboard(order_id: str) -> dict:
@@ -551,14 +559,8 @@ def main():
         written = write_to_google_sheets(new_jobs)
         print(f"[fl.ru] Sheets write result: {written} rows", file=sys.stderr)
 
-    # Send to Telegram
+    # Send to Telegram — just job cards, no header
     if new_jobs:
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        header = f"🤖 <b>[fl.ru] Новые AI-заказы: {len(new_jobs)}</b>\n<i>Время поиска: {now_str}</i>\n"
-        print(f"[fl.ru] Sending Telegram header...", file=sys.stderr)
-        send_telegram(header)
-        time.sleep(0.5)
-
         for job in new_jobs:
             msg = format_order(job)
             print(f"[fl.ru] Sending job {job['id']} to Telegram...", file=sys.stderr)

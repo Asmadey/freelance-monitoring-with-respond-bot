@@ -49,10 +49,11 @@ TG_CHAT_ID = "128204572"
 # Authorised users — only these Telegram user IDs can use the bot
 ALLOWED_USERS = {128204572, 253309061}
 
-# Ollama API (deepseek-v4-flash)
-OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "https://ollama.com/v1")
-OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "")
-LLM_MODEL = "deepseek-v4-flash"
+# OpenRouter API (deepseek-v4-flash-0731)
+# Migrated from Ollama Cloud → OpenRouter (weekly usage limit reached)
+LLM_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+LLM_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+LLM_MODEL = "deepseek/deepseek-v4-flash-0731"
 LLM_MAX_TOKENS = 4096
 LLM_TEMPERATURE = 0.7
 
@@ -61,6 +62,7 @@ SCRIPTS_DIR = Path(os.path.expanduser("~/.hermes/scripts"))
 if not (SCRIPTS_DIR / "cover_letter_bot.py").exists():
     SCRIPTS_DIR = Path("/home/hermes/.hermes/scripts")
 SYSTEM_PROMPT_PATH = SCRIPTS_DIR / "cover_letter_system_prompt.md"
+SALES_EVENT_PROMPT_PATH = SCRIPTS_DIR / "sales_event_system_prompt.md"
 
 # JSONL cache paths (same dirs as scrapers)
 DATA_DIR = Path(os.path.expanduser("~/.hermes/data"))
@@ -74,6 +76,7 @@ JSONL_MAP = {
     "fl": DATA_DIR / "fl_ru" / "fl_ru_orders.jsonl",
     "freelance": DATA_DIR / "freelance_ru" / "freelance_ru_orders.jsonl",
     "upwork": DATA_DIR / "upwork" / "upwork_orders.jsonl",
+    "hh": DATA_DIR / "sales_event" / "sales_event_vacancies.jsonl",
 }
 
 # Firecrawl (for youdo full text)
@@ -87,6 +90,7 @@ LETTER_LIMITS = {
     "fl": 1200,
     "freelance": 1200,
     "youdo": 1200,
+    "hh": 1200,
 }
 DEFAULT_LETTER_LIMIT = 1200
 
@@ -103,8 +107,18 @@ def load_system_prompt() -> str:
     return SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
 
 
+def load_sales_event_prompt() -> str:
+    """Load system prompt for Sales & Event vacancy cover letters (candidate: Anna Kalyagina)."""
+    if not SALES_EVENT_PROMPT_PATH.exists():
+        logger.error("Sales event prompt file not found: %s", SALES_EVENT_PROMPT_PATH)
+        return "Ты — Анна Калягина, менеджер по продажам. Создай короткий отклик на вакансию. Объём: не более {CHAR_LIMIT} символов."
+    return SALES_EVENT_PROMPT_PATH.read_text(encoding="utf-8")
+
+
 SYSTEM_PROMPT = load_system_prompt()
-logger.info("System prompt loaded (%d chars)", len(SYSTEM_PROMPT))
+SALES_EVENT_PROMPT = load_sales_event_prompt()
+logger.info("System prompt loaded (%d chars), Sales event prompt loaded (%d chars)",
+            len(SYSTEM_PROMPT), len(SALES_EVENT_PROMPT))
 
 
 def find_in_jsonl(source: str, order_id: str) -> dict | None:
@@ -311,13 +325,13 @@ def get_order_text(source: str, order_id: str) -> str:
 
 
 def call_llm(system_prompt: str, user_prompt: str) -> str:
-    """Call deepseek-v4-flash via Ollama API."""
+    """Call deepseek-v4-flash-0731 via OpenRouter API."""
     logger.info("Calling LLM: model=%s, prompt=%d chars", LLM_MODEL, len(user_prompt))
     
     resp = requests.post(
-        f"{OLLAMA_BASE_URL}/chat/completions",
+        f"{LLM_BASE_URL}/chat/completions",
         headers={
-            "Authorization": f"Bearer {OLLAMA_API_KEY}",
+            "Authorization": f"Bearer {LLM_API_KEY}",
             "Content-Type": "application/json",
         },
         json={
@@ -328,6 +342,7 @@ def call_llm(system_prompt: str, user_prompt: str) -> str:
             ],
             "max_tokens": LLM_MAX_TOKENS,
             "temperature": LLM_TEMPERATURE,
+            "reasoning": {"enabled": False},
         },
         timeout=60,
     )
@@ -342,14 +357,19 @@ def call_llm(system_prompt: str, user_prompt: str) -> str:
     return content.strip()
 
 
-def send_telegram(text: str, parse_mode: str = "HTML", reply_to: int | None = None) -> bool:
-    """Send message to Telegram chat."""
+def send_telegram(text: str, parse_mode: str = "HTML", reply_to: int | None = None,
+                 chat_id: str | int | None = None) -> bool:
+    """Send message to Telegram chat.
+
+    If chat_id is None, falls back to TG_CHAT_ID (default owner chat).
+    """
     payload = {
-        "chat_id": TG_CHAT_ID,
+        "chat_id": chat_id if chat_id is not None else TG_CHAT_ID,
         "text": text,
         "parse_mode": parse_mode,
         "disable_web_page_preview": True,
     }
+    # @fl_aibot is NOT a forum — no message_thread_id
     if reply_to:
         payload["reply_to_message_id"] = reply_to
     
@@ -444,10 +464,11 @@ async def webhook(request: Request) -> Response:
         # 2. Determine per-source character limit
         char_limit = LETTER_LIMITS.get(source, DEFAULT_LETTER_LIMIT)
 
-        # 3. Build prompt with source-specific limit instruction
-        prompt_with_limit = SYSTEM_PROMPT.replace(
+        # 3. Select system prompt: hh → Anna Kalyagina, others → default
+        base_prompt = SALES_EVENT_PROMPT if source == "hh" else SYSTEM_PROMPT
+        prompt_with_limit = base_prompt.replace(
             "{CHAR_LIMIT}", str(char_limit)
-        ) if "{CHAR_LIMIT}" in SYSTEM_PROMPT else SYSTEM_PROMPT
+        ) if "{CHAR_LIMIT}" in base_prompt else base_prompt
 
         # 4. Call LLM
         cover_letter = call_llm(prompt_with_limit, order_text)
@@ -456,15 +477,17 @@ async def webhook(request: Request) -> Response:
         cover_letter = truncate_to_limit(cover_letter, limit=char_limit)
         
         # 4. Send as monospace (preformatted) — copy-pasteable
+        # Reply in the SAME chat where the button was pressed (so all allowed users get the letter)
         tg_text = f"<pre>{html.escape(cover_letter)}</pre>"
-        send_telegram(tg_text, parse_mode="HTML", reply_to=message_id)
-        logger.info("Cover letter sent (%d chars)", len(cover_letter))
+        send_telegram(tg_text, parse_mode="HTML", reply_to=message_id, chat_id=chat_id)
+        logger.info("Cover letter sent (%d chars) to chat_id=%s", len(cover_letter), chat_id)
         
     except Exception as e:
         logger.error("Failed to generate cover letter: %s", e, exc_info=True)
         send_telegram(
             f"❌ Ошибка генерации отклика: {html.escape(str(e)[:200])}",
             reply_to=message_id,
+            chat_id=chat_id,
         )
     
     return Response(status_code=200)
@@ -473,7 +496,8 @@ async def webhook(request: Request) -> Response:
 @app.get("/health")
 async def health():
     """Health check endpoint."""
-    return {"status": "ok", "model": LLM_MODEL, "prompt_loaded": len(SYSTEM_PROMPT)}
+    return {"status": "ok", "model": LLM_MODEL, "prompt_loaded": len(SYSTEM_PROMPT),
+            "sales_event_prompt": len(SALES_EVENT_PROMPT)}
 
 
 @app.get("/")

@@ -3,3 +3,5 @@ __pycache__/
 .env
 *.jsonl
 fl_aibot_token.txt
+fl-aibot-chats.json
+*.json

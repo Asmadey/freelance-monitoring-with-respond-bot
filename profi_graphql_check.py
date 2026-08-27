@@ -31,23 +31,39 @@ logging.basicConfig(
 logger = logging.getLogger("profi_graphql_check")
 
 # Telegram: @fl_aibot (Freelance Jobs bot)
-TG_BOT_TOKEN = "8776532572:AAGh2OnHOaUjZAs-M-04nluayq2-qM4O8fk"
-TG_CHAT_ID = "128204572"
+# Load @fl_aibot token from external file
+import os as _os
+_TF = "/home/hermes/.hermes/config/fl_aibot_token.txt"
+TG_BOT_TOKEN = open(_TF).read().strip() if _os.path.exists(_TF) else os.environ.get("TG_BOT_TOKEN", "")
+if not TG_BOT_TOKEN or "***" in TG_BOT_TOKEN:
+    raise RuntimeError(f"Cannot load @fl_aibot token from {_TF}")
+
+# Multi-chat: send to all authorised users via shared helper
+import tg_multicast
+TG_CHAT_IDS = tg_multicast.get_chat_ids()
 
 SOCKS_PROXY = {"http": "socks5h://127.0.0.1:10808", "https": "socks5h://127.0.0.1:10808"}
 NO_PROXY = None  # direct connection
 
 def get_proxy():
     """Return working proxy dict, or None for direct connection.
-    Tests SOCKS5 proxy with a quick TCP connect; falls back to direct if unavailable.
+    Tests SOCKS5 proxy with a real HTTPS request (not just TCP connect),
+    because VLESS tunnel can be TCP-up but TLS-broken.
+    Falls back to direct if proxy is unavailable or TLS fails.
     """
+    import requests as _r
     import socket as _sock
     try:
+        # Quick TCP check first
         s = _sock.create_connection(("127.0.0.1", 10808), timeout=3)
         s.close()
+        # Real HTTPS test through proxy — catches TLS-broken VLESS
+        test = _r.get("https://api.profi.ru", proxies=SOCKS_PROXY, timeout=8)
+        # 404 is expected for root endpoint, any HTTP response = proxy works
+        logger.info("SOCKS5 proxy OK (HTTP %d via VLESS)", test.status_code)
         return SOCKS_PROXY
-    except OSError:
-        logger.warning("SOCKS5 proxy unavailable, using direct connection")
+    except Exception as e:
+        logger.warning("SOCKS5 proxy unusable (%s), using direct connection", e)
         return NO_PROXY
 
 PROXY = get_proxy()
@@ -76,7 +92,7 @@ def save_error_alerts(data: dict) -> None:
     )
 
 
-def was_error_alerted_recently(error_key: str, cooldown_seconds: int = 3600) -> bool:
+def was_error_alerted_recently(error_key: str, cooldown_seconds: int = 43200) -> bool:
     alerts = load_error_alerts()
     last = alerts.get(error_key, 0)
     return (time.time() - last) < cooldown_seconds
@@ -323,8 +339,12 @@ def snippet_tags(snippet: dict) -> list[str]:
     return tags
 
 
-def order_url(snippet: dict) -> str:
+def order_url_pc(snippet: dict) -> str:
     return f"https://profi.ru/backoffice/n.php?o={snippet['id']}"
+
+
+def order_url_mobile(snippet: dict) -> str:
+    return f"https://profi.ru/backoffice?o={snippet['id']}"
 
 
 def format_order(snippet: dict, fetched_client: str = "") -> str:
@@ -335,7 +355,8 @@ def format_order(snippet: dict, fetched_client: str = "") -> str:
     desc = snippet.get("description", "")
     if len(desc) > 300:
         desc = desc[:300] + "…"
-    url = order_url(snippet)
+    url_pc = order_url_pc(snippet)
+    url_mob = order_url_mobile(snippet)
 
     lines = ["#Profi"]
     lines.append("")
@@ -350,33 +371,16 @@ def format_order(snippet: dict, fetched_client: str = "") -> str:
     if desc:
         lines.append(f"📝 {desc}")
     lines.append("")
-    lines.append(f"🔗 <a href=\"{url}\">{snippet['id']}</a>")
+    lines.append(f'🔗 <a href="{url_pc}">{snippet["id"]}</a> | 📲 <a href="{url_mob}">{snippet["id"]}</a>')
     return "\n".join(lines)
 
 
 def send_telegram(text: str, parse_mode: str = "HTML", reply_markup: dict | None = None) -> bool:
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        logger.warning("Telegram credentials not set")
-        return False
-    payload = {
-        "chat_id": TG_CHAT_ID,
-        "text": text,
-        "parse_mode": parse_mode,
-        "disable_web_page_preview": True,
-    }
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    try:
-        resp = requests.post(
-            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-            json=payload,
-            timeout=20,
-        )
-        resp.raise_for_status()
-        return True
-    except Exception:
-        logger.exception("Telegram send failed")
-        return False
+    """Send message to all chats via multicast helper."""
+    return tg_multicast.send_multicast(
+        TG_BOT_TOKEN, TG_CHAT_IDS, text,
+        parse_mode=parse_mode, reply_markup=reply_markup, tag="profi",
+    )
 
 
 def cover_letter_keyboard(order_id: str) -> dict:
@@ -389,10 +393,10 @@ def cover_letter_keyboard(order_id: str) -> dict:
 
 
 def run_auth_refresh(max_attempts=2, retry_delay=5):
-    """Run profi_auth_refresh.py renew, with retry on failure (e.g. 423 mutex locked)."""
-    script = Path(os.path.expanduser("~/.hermes/scripts/profi_auth_refresh.py"))
+    """Run profi_auth.py renew (unified auth script), with retry on failure."""
+    script = Path(os.path.expanduser("~/.hermes/scripts/profi_auth.py"))
     if not script.exists():
-        script = Path("/home/hermes/.hermes/scripts/profi_auth_refresh.py")
+        script = Path("/home/hermes/.hermes/scripts/profi_auth_refresh.py")  # fallback
     for attempt in range(max_attempts):
         logger.info("JWT expired / missing, running silent refresh (attempt %d/%d)", attempt + 1, max_attempts)
         proc = subprocess.run(
@@ -470,13 +474,35 @@ def main() -> int:
             time.sleep(NETWORK_RETRY_DELAY)
 
     if not refresh_ok:
-        logger.warning("Proactive refresh failed after %d attempts, will try fetch with existing JWT", NETWORK_RETRY_ATTEMPTS)
+        logger.warning("Proactive refresh failed after %d attempts, initiating SMS re-login", NETWORK_RETRY_ATTEMPTS)
+        # Auto-escalate: try SMS re-login via profi_auth.py sms
+        sms_script = Path(os.path.expanduser("~/.hermes/scripts/profi_auth.py"))
+        if sms_script.exists():
+            sms_proc = subprocess.run(
+                [sys.executable, str(sms_script), "sms"],
+                capture_output=True, text=True, timeout=120,
+            )
+            if sms_proc.returncode == 0:
+                logger.info("SMS re-login initiated — waiting for user to send code")
+                # Alert user that code is needed
+                if not was_error_alerted_recently("sms_needed", cooldown_seconds=600):
+                    send_telegram(
+                        "📱 <b>[profi.ru]</b>\n\n"
+                        "Сессия протухла, SMS-код отправлен на ваш телефон.\n"
+                        "Пришли 4 цифры в ответ — я обновлю токен автоматически.\n"
+                        "<code>python3 ~/.hermes/scripts/profi_auth.py verify XXXX</code>"
+                    )
+                    mark_error_alerted("sms_needed")
+                return 1  # exit — cron will retry on next tick; user sends code manually
+            else:
+                logger.error("SMS re-login failed: %s", sms_proc.stderr or sms_proc.stdout)
+        # Fallback: old-style alert
         if jwt is None:
             error_key = "jwt_missing"
-            if not was_error_alerted_recently(error_key, cooldown_seconds=3600):
+            if not was_error_alerted_recently(error_key, cooldown_seconds=43200):
                 send_telegram(
-                    f"⚠️ <b>[profi.ru]</b>\n\nНе найден JWT и не удалось обновить ({NETWORK_RETRY_ATTEMPTS} попыток). Запустите вручную:\n"
-                    "<code>python3 ~/.hermes/scripts/profi_auth_refresh.py renew</code>"
+                    f"⚠️ <b>[profi.ru]</b>\n\nНе найден JWT и не удалось обновить ({NETWORK_RETRY_ATTEMPTS} попыток).\n"
+                    "SMS re-login также не удался. Нужен свежий HAR из приложения profi."
                 )
                 mark_error_alerted(error_key)
             return 1

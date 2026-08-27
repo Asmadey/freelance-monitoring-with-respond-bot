@@ -201,6 +201,7 @@ def send_telegram(text: str) -> dict:
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
+    # @fl_aibot is NOT a forum — no message_thread_id
 
     try:
         resp = requests.post(url, json=payload, timeout=30)

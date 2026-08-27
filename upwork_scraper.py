@@ -24,7 +24,10 @@ SEEN_EXPIRE_HOURS = 720  # 30 days
 import re as _re
 _TOK_M = _re.search(r'TG_BOT_TOKEN\s*=\s*"([^"]+)"', open("/home/hermes/.hermes/scripts/profi_graphql_check.py").read())
 TG_BOT_TOKEN=_TOK_M.group(1) if _TOK_M else ""
-TG_CHAT_ID = "128204572"
+
+# Multi-chat: send to all authorised users via shared helper
+import tg_multicast
+TG_CHAT_IDS = tg_multicast.get_chat_ids()
 
 # JSONL cache for cover letter bot
 DATA_DIR = Path("/home/hermes/.hermes/data/upwork")
@@ -51,6 +54,8 @@ KEYWORDS = [
 
 # Location markers that indicate the client restricts applications to US freelancers.
 # These are matched case-insensitively against the raw markdown block.
+# NOTE: the raw markdown keeps the unicode bullet "Remote • United States" as a location
+# line for US-only jobs, so "remote • united states" must be treated as a US-only marker.
 US_LOCATION_MARKERS = [
     "only freelancers located in the u.s.",
     "only freelancers located in the us",
@@ -78,6 +83,37 @@ US_LOCATION_MARKERS = [
     "us citizen",
     "u.s. citizen",
     "american citizen",
+    # --- extensions for variants seen in the wild (incl. the exact phrase the user quoted) ---
+    "only freelancers located in the u.s. may apply",
+    "only freelancers located in the us may apply",
+    "only freelancers located in the united states may apply",
+    "located in the united states",
+    "located in the us",
+    "located in the u.s.",
+    "remote \u2022 united states",
+    "remote \u2022 usa",
+    "remote \u2022 u.s.",
+    "location: u.s.",
+    "location: us",
+    "location: united states",
+    "us work authorization",
+    "u.s. work authorization",
+    "work authorization in the us",
+    "work authorization in the u.s.",
+    "must have us work authorization",
+    "no offshore",
+    "no outsourcing",
+    "us residents",
+    "u.s. residents",
+    "us freelancers only",
+    "u.s. freelancers only",
+    "w-2",
+    "w2 only",
+    "in the united states only",
+    "states only",
+    "usa only",
+    "u.s. only candidates",
+    "us only candidates",
 ]
 
 
@@ -85,6 +121,48 @@ def has_us_location_restriction(block_text):
     """Return True if the listing block contains US-only location markers."""
     text_lower = block_text.lower()
     return any(marker in text_lower for marker in US_LOCATION_MARKERS)
+
+
+# Detail-page markers — these appear on individual job pages (not search results)
+# when scraped with includeTags=['section','div','span'] to force JS-rendered content extraction.
+DETAIL_US_MARKERS = [
+    "only freelancers located in the u.s. may apply",
+    "only freelancers located in the us may apply",
+    "u.s. located freelancers only",
+    "us located freelancers only",
+    "only freelancers located in the u.s.",
+    "only freelancers located in the us",
+    "only freelancers located in the united states",
+    "only freelancers located in the united states may apply",
+]
+
+
+def check_job_detail_us_restriction(job_url):
+    """Scrape job detail page with includeTags to extract JS-rendered location badge.
+    Returns True if the job is US-only restricted."""
+    payload = json.dumps({
+        "url": job_url,
+        "formats": ["markdown"],
+        "timeout": 30000,
+        "includeTags": ["section", "div", "span"],
+    }).encode()
+    req = Request(FIRECRAWL_URL, data=payload, headers={"Content-Type": "application/json"})
+    try:
+        with urlopen(req, timeout=90) as resp:
+            raw = resp.read()
+        data = json.loads(raw)
+        md = data.get("data", {}).get("markdown", "")
+        if not md:
+            return False
+        md_lower = md.lower()
+        for marker in DETAIL_US_MARKERS:
+            if marker in md_lower:
+                print(f"[FILTER-DETAIL] US-only restriction found on detail page: {job_url}", file=sys.stderr)
+                return True
+        return False
+    except Exception as e:
+        print(f"[WARN] Detail page check failed for {job_url}: {e}", file=sys.stderr)
+        return False  # If we can't check, don't block the job
 
 
 def clean_html(text):
@@ -474,8 +552,20 @@ def get_access_token():
         return json.load(resp)["access_token"]
 
 
+def categorize_job(title):
+    """Assign a job to a category based on its title keywords."""
+    t = title.lower()
+    if any(k in t for k in ["n8n", "zapier", "make", "workflow", "automation", "agent", "bot", "hyperagent", "claude", "langchain", "langgraph", "llm", "ai agent", "aiagent", "ai automation", "ai workflow", "ai engineer", "ai developer", "ai architect", "ai/ml", "ai/llm", "ai-first", "ai native", "ai-native"]):
+        return "🤖 AI-агенты / автоматизация"
+    if any(k in t for k in ["full-stack", "full stack", "fullstack", "react", "node", "python", "flutter", "front", "backend", "web", "saas", "mvp", "api", "developer", "engineer", "dev"]):
+        return "🛠 Full-Stack / AI-разработка"
+    if any(k in t for k in ["crm", "data", "database", "hubspot", "gohighlevel", "mls", "idx", "integration", "sheets", "excel", "lead", "marketing", "paid media", "seo"]):
+        return "📊 Данные / CRM / интеграции"
+    return "🔬 Прочее"
+
+
 def format_telegram(jobs, total_rows, max_jobs=5):
-    """Format Telegram report: date header, stats, top-N jobs."""
+    """Format Telegram report: date header, stats, jobs grouped by category."""
     today_str = datetime.now().strftime("%d.%m.%Y")
 
     if not jobs:
@@ -495,51 +585,49 @@ def format_telegram(jobs, total_rows, max_jobs=5):
         "",
         f"[🔗 Открыть таблицу]({SHEET_URL})",
         "",
-        "====",
-        "",
-        f"🔥 *ТОП-{min(len(jobs), max_jobs)} находки сегодня*",
+        "=====",
     ]
 
-    for i, j in enumerate(jobs[:max_jobs], 1):
-        # Clean title: remove trailing colon
-        title = j['title'].rstrip(':').strip()
-        # Escape MarkdownV2 special chars inside link text
-        safe_title = title.replace(']', ' ').replace('[', ' ').replace('\\', ' ')
-        lines.append(
-            f"{i}. [{safe_title}]({j['url']})\n"
-            f"💰 {j['rate']}  |  🎯 {j['level']} |  🕐 {j['posted']}"
-        )
-        # Description on its own line, only if meaningful
-        if j["desc"] != "(no description)":
-            desc_short = j["desc"][:150] + "…" if len(j["desc"]) > 150 else j["desc"]
-            lines.append(f"📝 {desc_short}")
+    # Group by category, preserving original order within each group
+    categories = ["🔥 Топ по ставке", "🤖 AI-агенты / автоматизация",
+                  "🛠 Full-Stack / AI-разработка", "📊 Данные / CRM / интеграции", "🔬 Прочее"]
+    grouped = {c: [] for c in categories}
+    for j in jobs:
+        grouped[categorize_job(j["title"])].append(j)
+
+    # Top by rate: parse hourly max rate, sort desc
+    def max_rate(j):
+        m = re.search(r"\$([\d,.]+)-([\d,.]+)/hr", j["rate"])
+        if m:
+            return float(m.group(2).replace(",", ""))
+        m = re.search(r"Fixed \$([\d,.]+)", j["rate"])
+        if m:
+            return float(m.group(1).replace(",", ""))
+        return 0.0
+
+    top = sorted(jobs, key=max_rate, reverse=True)[:3]
+    grouped["🔥 Топ по ставке"] = top
+
+    for cat in categories:
+        items = grouped[cat]
+        if not items:
+            continue
+        lines.append("")
+        lines.append(f"*{cat}*")
+        for j in items:
+            title = j['title'].rstrip(':').strip()
+            safe_title = title.replace(']', ' ').replace('[', ' ').replace('\\', ' ')
+            lines.append(f"- [{safe_title}]({j['url']}) · {j['rate']}")
 
     return "\n".join(lines)
 
 
 def send_telegram(text, parse_mode="HTML", reply_markup=None):
-    """Send message to @fl_aibot Telegram chat."""
-    if not TG_BOT_TOKEN:
-        return False
-    try:
-        payload = {
-            "chat_id": TG_CHAT_ID,
-            "text": text,
-            "parse_mode": parse_mode,
-            "disable_web_page_preview": True,
-        }
-        if reply_markup:
-            payload["reply_markup"] = reply_markup
-        resp = requests.post(
-            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-            json=payload,
-            timeout=20,
-        )
-        resp.raise_for_status()
-        return True
-    except Exception as e:
-        print(f"[Upwork] Telegram send failed: {e}", file=sys.stderr)
-        return False
+    """Send message to all chats via multicast helper."""
+    return tg_multicast.send_multicast(
+        TG_BOT_TOKEN, TG_CHAT_IDS, text,
+        parse_mode=parse_mode, reply_markup=reply_markup, tag="Upwork",
+    )
 
 
 def cover_letter_keyboard(order_id: str) -> dict:
@@ -618,7 +706,37 @@ def main():
     # Sort by relevance
     new_jobs.sort(key=lambda j: (-j["score"]))
 
-    # Save state
+    # === US-only filter via detail page scrape ===
+    # Search results don't show location restrictions; the "Only freelancers located
+    # in the U.S. may apply" badge is JS-rendered and only visible on the job detail page.
+    # Scrape each new job's detail page (with includeTags to force badge extraction) and
+    # filter out US-only restricted jobs before they reach Google Sheets / Telegram.
+    if new_jobs:
+        print(f"[Upwork Scraper] Checking {len(new_jobs)} new jobs for US-only restriction via detail pages (parallel)...", file=sys.stderr)
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        worldwide_jobs = []
+        us_blocked = []
+        # Parallel detail-page checks: 5 workers keeps total time under ~60s for 24 jobs
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            future_map = {pool.submit(check_job_detail_us_restriction, j["url"]): j for j in new_jobs}
+            for future in as_completed(future_map):
+                j = future_map[future]
+                try:
+                    is_us = future.result()
+                except Exception:
+                    is_us = False
+                if is_us:
+                    us_blocked.append(j)
+                else:
+                    worldwide_jobs.append(j)
+        if us_blocked:
+            print(f"[Upwork Scraper] Filtered out {len(us_blocked)} US-only jobs:", file=sys.stderr)
+            for j in us_blocked:
+                print(f"  ❌ US-only: {j['title'][:70]}", file=sys.stderr)
+        new_jobs = worldwide_jobs
+        print(f"[Upwork Scraper] After US-only detail filter: {len(new_jobs)} worldwide jobs", file=sys.stderr)
+
+    # Save state (after filter, so US-only jobs are still marked as seen → not re-checked)
     save_seen(updated_seen)
 
     # Get total rows from Google Sheets

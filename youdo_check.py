@@ -39,8 +39,16 @@ logging.basicConfig(
 logger = logging.getLogger("youdo_check")
 
 # Telegram: @fl_aibot (Freelance Jobs bot)
-TG_BOT_TOKEN = "8776532572:AAGh2OnHOaUjZAs-M-04nluayq2-qM4O8fk"
-TG_CHAT_ID = "128204572"
+# Load @fl_aibot token from external file
+import os as _os
+_TF = "/home/hermes/.hermes/config/fl_aibot_token.txt"
+TG_BOT_TOKEN = open(_TF).read().strip() if _os.path.exists(_TF) else os.environ.get("TG_BOT_TOKEN", "")
+if not TG_BOT_TOKEN or "***" in TG_BOT_TOKEN:
+    raise RuntimeError(f"Cannot load @fl_aibot token from {_TF}")
+
+# Multi-chat: send to all authorised users via shared helper
+import tg_multicast
+TG_CHAT_IDS = tg_multicast.get_chat_ids()
 
 # Data directory
 DATA_DIR = Path(os.path.expanduser("~/.hermes/data/youdo"))
@@ -182,30 +190,11 @@ def mark_error_alerted(error_key: str) -> None:
 
 
 def send_telegram(message: str, reply_markup: dict | None = None) -> bool:
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        logger.warning("Telegram credentials not set")
-        return False
-    try:
-        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-        # Telegram message limit is 4096 chars
-        if len(message) > 4000:
-            message = message[:4000] + "…"
-        payload = {
-            "chat_id": TG_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }
-        if reply_markup:
-            payload["reply_markup"] = reply_markup
-        resp = requests.post(url, json=payload, timeout=10)
-        if resp.status_code != 200:
-            logger.error(f"Telegram API error {resp.status_code}: {resp.text[:200]}")
-            return False
-        return True
-    except Exception as e:
-        logger.exception("Telegram send failed")
-        return False
+    """Send message to all chats via multicast helper."""
+    return tg_multicast.send_multicast(
+        TG_BOT_TOKEN, TG_CHAT_IDS, message,
+        parse_mode="HTML", reply_markup=reply_markup, tag="youdo",
+    )
 
 
 def cover_letter_keyboard(order_id: str) -> dict:
