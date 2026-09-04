@@ -12,7 +12,7 @@ from pathlib import Path
 import urllib.parse
 from urllib.request import Request, urlopen
 import requests
-from urllib.error import URLError
+from urllib.error import URLError, HTTPError
 
 FIRECRAWL_URL = "http://127.0.0.1:9123/v2/scrape"
 FIRECRAWL_FALLBACK_URL = "https://api.firecrawl.dev/v2/scrape"
@@ -21,9 +21,14 @@ STATE_FILE = "/home/hermes/.hermes/upwork_seen_urls.json"
 SEEN_EXPIRE_HOURS = 720  # 30 days
 
 # Telegram: @fl_aibot (Freelance Jobs bot) — same token as other scrapers
-import re as _re
-_TOK_M = _re.search(r'TG_BOT_TOKEN\s*=\s*"([^"]+)"', open("/home/hermes/.hermes/scripts/profi_graphql_check.py").read())
-TG_BOT_TOKEN=_TOK_M.group(1) if _TOK_M else ""
+# 2026-09-03 fix: profi_graphql_check.py no longer hardcodes the token as a string
+# (it reads it from the token file now), so regex extraction broke and silently
+# produced an empty token → all TG sends failed with False. Read the file directly.
+_TF = "/home/hermes/.hermes/config/fl_aibot_token.txt"
+try:
+    TG_BOT_TOKEN = open(_TF).read().strip()
+except OSError:
+    TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 
 # Multi-chat: send to all authorised users via shared helper
 import tg_multicast
@@ -498,15 +503,29 @@ SHEET_URL = "https://docs.google.com/spreadsheets/d/1R4uQG-yy2mZ4zuJVkQgrfxoVW6N
 
 
 def get_total_rows(access_token):
-    """Get total number of data rows in the Upwork sheet (excluding header)."""
+    """Get total number of data rows in the Upwork sheet (excluding header).
+
+    Retries on transient HTTP 5xx: a single Google Sheets API glitch must not
+    fail the whole daily report (same policy as kwork_check.py fetch retry).
+    """
     SPREADSHEET_ID = "1R4uQG-yy2mZ4zuJVkQgrfxoVW6N60suUmnEVKBFolok"
     GID = 872962241
 
-    # Find sheet name by gid
-    req = Request(f"https://sheets.googleapis.com/v4/spreadsheets/{SPREADSHEET_ID}")
-    req.add_header("Authorization", f"Bearer {access_token}")
-    with urlopen(req) as resp:
-        sheet_info = json.load(resp)
+    for attempt in range(3):
+        try:
+            # Find sheet name by gid
+            req = Request(f"https://sheets.googleapis.com/v4/spreadsheets/{SPREADSHEET_ID}")
+            req.add_header("Authorization", f"Bearer {access_token}")
+            with urlopen(req, timeout=30) as resp:
+                sheet_info = json.load(resp)
+            break
+        except HTTPError as e:
+            if e.code >= 500 and attempt < 2:
+                print(f"[Sheets] HTTP {e.code} on get_total_rows (attempt {attempt + 1}), retrying in 15s...", file=sys.stderr)
+                time.sleep(15)
+            else:
+                print(f"[Sheets] get_total_rows failed after {attempt + 1} attempt(s): {e}", file=sys.stderr)
+                return 0
 
     sheet_name = None
     for sheet in sheet_info["sheets"]:
